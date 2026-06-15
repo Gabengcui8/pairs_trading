@@ -1,0 +1,17 @@
+# Core
+numpy>=1.24
+pandas>=2.0
+statsmodels>=0.14     # Engle-Granger cointegration, OLS hedge ratio
+yfinance>=0.2.40      # daily prices + VIX
+
+# Strategy variants (section 6)
+arch>=6.3             # GARCH(1,1) volatility-based capital allocation (6.5)
+scikit-learn>=1.3     # PCA + KMeans clustering for pair restriction (6.3)
+
+# Reporting
+matplotlib>=3.7       # charts
+openpyxl>=3.1         # Excel export
+
+# Optional: point-in-time S&P 500 constituents + Compustat fundamentals
+# Only needed if you enable the WRDS hooks in download_data.py
+# wrds>=3.1
