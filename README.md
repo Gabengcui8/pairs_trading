@@ -117,9 +117,9 @@ bias), enable the WRDS hooks in `download_data.py`:
 - **Robustness filters.** Cointegration pairs must remain cointegrated in the
   recent half of the formation window, have a plausible mean-reversion
   half-life, and cross their formation mean often enough to be tradeable.
-- **Equity spread.** Cointegration uses log prices by default and tests both
-  Engle-Granger regression directions, retaining the stronger formation-only
-  relationship. Set `use_log_prices=False` to reproduce the level-price model.
+- **Equity spread.** Cointegration tests both Engle-Granger regression
+  directions, retaining the stronger formation-only relationship. The tested
+  default uses price levels; set `use_log_prices=True` for a log-price spread.
 - **Stop re-entry guard.** After a stop or maximum holding-period exit, a pair
   must normalise inside `reentry_z` before another entry is allowed. This avoids
   repeatedly trading a relationship that is still breaking down.
