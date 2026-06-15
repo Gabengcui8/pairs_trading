@@ -2,11 +2,16 @@
 
 **QF621 Quantitative Trading Strategies — Group 9**
 
-A configurable statistical-arbitrage pairs-trading backtester. Cointegrated
-pairs are identified on a 12-month formation window, traded on the following
-6-month window via a z-score spread signal, and the window is rolled every
-6 months. Every variant in the project proposal (section 6) is a `Config`
-toggle, so each can be tested by changing one line.
+A configurable statistical-arbitrage pairs-trading backtester. Pairs are
+selected on a 12-month formation window, traded on the following 6-month
+window via a z-score spread signal, and the window is rolled every 6 months.
+Every variant in the project proposal (section 6) is a `Config` toggle, so each
+can be tested by changing one line.
+
+The default runner uses same-sector correlation pairs with dynamic allocation
+across active trades because that baseline was more stable across the supplied
+pre- and post-COVID walk-forward samples. Cointegration remains in the variant
+comparison with additional formation-only stability filters.
 
 ---
 
@@ -109,3 +114,12 @@ bias), enable the WRDS hooks in `download_data.py`:
   window; conditional variance is rolled forward over the trading window to
   forecast next-day volatility, and active pairs are weighted ∝ 1/σ.
 - **Costs.** 10 bps per leg per trade, charged on every position change.
+- **Robustness filters.** Cointegration pairs must remain cointegrated in the
+  recent half of the formation window, have a plausible mean-reversion
+  half-life, and cross their formation mean often enough to be tradeable.
+- **Equity spread.** Cointegration uses log prices by default and tests both
+  Engle-Granger regression directions, retaining the stronger formation-only
+  relationship. Set `use_log_prices=False` to reproduce the level-price model.
+- **Stop re-entry guard.** After a stop or maximum holding-period exit, a pair
+  must normalise inside `reentry_z` before another entry is allowed. This avoids
+  repeatedly trading a relationship that is still breaking down.

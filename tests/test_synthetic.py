@@ -49,7 +49,10 @@ def main():
     form = prices.iloc[:252]
     fy = prices.index[251].year
     base = pt.Config(n_pairs=10, min_corr=0.3, formation_days=252,
-                     trading_days=126, step_days=126)
+                     trading_days=126, step_days=126,
+                     recent_p_value_threshold=0.20,
+                     min_half_life=0.5, max_half_life=200,
+                     min_mean_crossings=1, use_log_prices=False)
 
     # 6.3 restrictions reduce the candidate set
     n_none = len(pt.build_candidates(form, base, meta, fy))
@@ -69,6 +72,17 @@ def main():
     z = pd.Series(np.linspace(-3, 3, 60), index=prices.index[:60])
     ent = (base.entry_z * (vix.iloc[:60] / vix.iloc[:252].median()).clip(0.6, 1.4)).values
     assert (pt.generate_positions(z, base).values != pt.generate_positions(z, base, ent).values).any()
+
+    # A stopped spread must normalise before it can enter again.
+    z_stop = pd.Series([0, -2.1, -3.2, -3.1, -2.8, -0.8, -2.2])
+    p_stop = pt.generate_positions(z_stop, base)
+    assert p_stop.tolist() == [0, 1, 0, 0, 0, 0, 1], p_stop.tolist()
+
+    # Formation diagnostics distinguish reversion from one-way drift.
+    reverting = pd.Series(np.sin(np.linspace(0, 20, 252)))
+    drifting = pd.Series(np.arange(252, dtype=float))
+    assert np.isfinite(pt.spread_diagnostics(reverting)["half_life"])
+    assert pt.spread_diagnostics(drifting)["half_life"] > 1e6
 
     # 6.5 every allocation runs end-to-end and trades
     variants = {

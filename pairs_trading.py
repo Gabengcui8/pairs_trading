@@ -66,10 +66,16 @@ class Config:
     # --- 6.2 pair-selection method ---
     method: str = "cointegration"    # "cointegration" | "distance" | "correlation"
     p_value_threshold: float = 0.05  # cointegration significance
+    recent_p_value_threshold: float = 0.10
+    recent_fraction: float = 0.50    # confirm coint on latest formation data
     min_r2: float = 0.80             # correlation-method minimum R^2
     n_pairs: int = 10                # top-N pairs
     min_corr: float = 0.50           # cheap pre-filter before the slow coint test
     require_positive_beta: bool = True
+    use_log_prices: bool = False     # optional proportional spread for equities
+    min_half_life: float = 2.0
+    max_half_life: float = 60.0
+    min_mean_crossings: int = 4
 
     # --- 6.3 pair restrictions (each independently toggleable) ---
     restrict_same_sector: bool = False
@@ -86,6 +92,8 @@ class Config:
     entry_z: float = 2.0
     exit_z: float = 0.0
     stop_z: float = 3.0
+    reentry_z: float = 1.0           # re-arm after a stopped spread normalises
+    max_holding_days: int = 60
     vix_adjust: bool = False         # scale entry threshold by VIX regime
     vix_scale_lo: float = 0.6        # calm  -> lower threshold -> trade more
     vix_scale_hi: float = 1.4        # turbulent -> higher threshold
@@ -267,6 +275,28 @@ def estimate_hedge_ratio(y: pd.Series, x: pd.Series):
     return float(res.params[0]), float(res.params[1])
 
 
+def spread_diagnostics(spread: pd.Series) -> dict:
+    """Formation-only mean-reversion diagnostics for pair selection."""
+    s = spread.dropna().astype(float)
+    if len(s) < 20 or s.std() == 0:
+        return {"half_life": np.inf, "mean_crossings": 0}
+
+    reg = pd.concat([
+        s.diff().rename("delta"),
+        s.shift(1).rename("lag"),
+    ], axis=1).dropna()
+    try:
+        gamma = float(sm.OLS(reg["delta"], sm.add_constant(reg["lag"])).fit().params["lag"])
+        half_life = -np.log(2) / gamma if gamma < 0 else np.inf
+    except Exception:
+        half_life = np.inf
+
+    centred = s - s.mean()
+    signs = np.sign(centred).replace(0, np.nan).ffill().bfill()
+    crossings = int((signs != signs.shift(1)).sum() - 1)
+    return {"half_life": float(half_life), "mean_crossings": max(crossings, 0)}
+
+
 def select_pairs(form: pd.DataFrame, candidates: list, cfg: Config) -> list:
     """
     Rank candidate pairs by the chosen method and return the top-N as records.
@@ -279,27 +309,64 @@ def select_pairs(form: pd.DataFrame, candidates: list, cfg: Config) -> list:
     recs = []
     for a, b in candidates:
         if cfg.method == "cointegration":
+            sa = np.log(form[a]) if cfg.use_log_prices else form[a]
+            sb = np.log(form[b]) if cfg.use_log_prices else form[b]
+            if abs(float(sa.corr(sb))) < cfg.min_corr:
+                continue
+
+            # Engle-Granger is asymmetric. Test both orientations and retain
+            # the more strongly cointegrated residual without using trade data.
             try:
-                _, pval, _ = coint(form[a], form[b])
+                _, p_ab, _ = coint(sa, sb)
+                _, p_ba, _ = coint(sb, sa)
             except Exception:
                 continue
+            if p_ba < p_ab:
+                a, b, sa, sb, pval = b, a, sb, sa, p_ba
+            else:
+                pval = p_ab
             if pval >= cfg.p_value_threshold:
                 continue
-            _, beta = estimate_hedge_ratio(form[a], form[b])
+            alpha, beta = estimate_hedge_ratio(sa, sb)
             if cfg.require_positive_beta and beta <= 0:
                 continue
-            recs.append({"a": a, "b": b, "score": pval, "beta": beta,
-                         "weight_mode": "beta_shares", "metric": "pvalue"})
+
+            recent_n = min(len(form), max(60, int(len(form) * cfg.recent_fraction)))
+            try:
+                _, recent_pval, _ = coint(sa.iloc[-recent_n:], sb.iloc[-recent_n:])
+            except Exception:
+                continue
+            if recent_pval >= cfg.recent_p_value_threshold:
+                continue
+
+            spread = sa - alpha - beta * sb
+            diag = spread_diagnostics(spread)
+            if not (cfg.min_half_life <= diag["half_life"] <= cfg.max_half_life):
+                continue
+            if diag["mean_crossings"] < cfg.min_mean_crossings:
+                continue
+
+            quality = pval * (1.0 + diag["half_life"] / cfg.max_half_life)
+            recs.append({"a": a, "b": b, "score": quality, "pvalue": pval,
+                         "recent_pvalue": float(recent_pval), "beta": beta,
+                         **diag,
+                         "weight_mode": ("log_beta" if cfg.use_log_prices
+                                         else "beta_shares"),
+                         "metric": "pvalue"})
 
         elif cfg.method == "correlation":
-            r2 = float(form[a].corr(form[b])) ** 2
+            sa = np.log(form[a]) if cfg.use_log_prices else form[a]
+            sb = np.log(form[b]) if cfg.use_log_prices else form[b]
+            r2 = float(sa.corr(sb)) ** 2
             if r2 < cfg.min_r2:
                 continue
-            _, beta = estimate_hedge_ratio(form[a], form[b])
+            _, beta = estimate_hedge_ratio(sa, sb)
             if cfg.require_positive_beta and beta <= 0:
                 continue
             recs.append({"a": a, "b": b, "score": -r2, "beta": beta,
-                         "weight_mode": "beta_shares", "metric": "R2"})
+                         "weight_mode": ("log_beta" if cfg.use_log_prices
+                                         else "beta_shares"),
+                         "metric": "R2"})
 
         elif cfg.method == "distance":
             na, nb = form[a] / form[a].iloc[0], form[b] / form[b].iloc[0]
@@ -320,6 +387,8 @@ def select_pairs(form: pd.DataFrame, candidates: list, cfg: Config) -> list:
 def make_spread(prices: pd.DataFrame, rec: dict) -> pd.Series:
     if rec["weight_mode"] == "beta_shares":
         return prices[rec["a"]] - rec["beta"] * prices[rec["b"]]
+    if rec["weight_mode"] == "log_beta":
+        return np.log(prices[rec["a"]]) - rec["beta"] * np.log(prices[rec["b"]])
     return prices[rec["a"]] / rec["norm_a"] - prices[rec["b"]] / rec["norm_b"]
 
 
@@ -330,6 +399,11 @@ def leg_weights(prices: pd.DataFrame, rec: dict):
         pb = (rec["beta"] * prices[rec["b"]]).shift(1)
         d = (pa.abs() + pb.abs()).replace(0, np.nan)
         return pa / d, pb / d
+    if rec["weight_mode"] == "log_beta":
+        gross = 1.0 + abs(rec["beta"])
+        wa = pd.Series(1.0 / gross, index=prices.index)
+        wb = pd.Series(abs(rec["beta"]) / gross, index=prices.index)
+        return wa, wb
     half = pd.Series(0.5, index=prices.index)
     return half, half
 
@@ -339,25 +413,45 @@ def generate_positions(z: pd.Series, cfg: Config, entry=None) -> pd.Series:
     Stateful entry/exit/stop signal, position in {-1, 0, +1}.
       +1 long spread  (long A, short B)  when z <= -entry
       -1 short spread (short A, long B)   when z >= +entry
-       0 flat after z reverts through exit_z, or after the stop is breached
+       0 flat after z reverts through exit_z, or after the stop is breached.
+    A stopped/timed-out spread must normalise inside +/- reentry_z before
+    another entry. This avoids repeated stop/re-entry churn during divergence.
     `entry` may be a per-day array (VIX-adjusted) or None (use cfg.entry_z).
     """
     zv = np.asarray(z, dtype=float)
     ev = np.full(len(zv), cfg.entry_z) if entry is None else np.asarray(entry, dtype=float)
     pos = np.zeros(len(zv))
     state = 0
+    armed = True
+    held = 0
     for t in range(len(zv)):
+        if not np.isfinite(zv[t]) or not np.isfinite(ev[t]):
+            pos[t] = state
+            continue
         if state == 0:
+            if not armed:
+                if abs(zv[t]) <= cfg.reentry_z:
+                    armed = True
+                pos[t] = 0
+                continue
             if zv[t] <= -ev[t]:
                 state = 1
+                held = 0
             elif zv[t] >= ev[t]:
                 state = -1
+                held = 0
         elif state == 1:
-            if zv[t] >= cfg.exit_z or zv[t] <= -cfg.stop_z:
+            held += 1
+            stopped = zv[t] <= -cfg.stop_z or held >= cfg.max_holding_days
+            if zv[t] >= cfg.exit_z or stopped:
                 state = 0
+                armed = not stopped
         elif state == -1:
-            if zv[t] <= cfg.exit_z or zv[t] >= cfg.stop_z:
+            held += 1
+            stopped = zv[t] >= cfg.stop_z or held >= cfg.max_holding_days
+            if zv[t] <= cfg.exit_z or stopped:
                 state = 0
+                armed = not stopped
         pos[t] = state
     return pd.Series(pos, index=z.index)
 
@@ -773,10 +867,14 @@ def run_period(label, start, end, base, meta=None, vix=None, verbose=True):
 
 if __name__ == "__main__":
     base = Config(
-        universe="sp500", method="cointegration", allocation="equal",
+        universe="sp500", method="correlation", allocation="dynamic",
         formation_days=252, trading_days=126, step_days=126,
-        n_pairs=10, entry_z=2.0, exit_z=0.0, stop_z=3.0,
-        p_value_threshold=0.05, min_corr=0.5, tc_bps=10.0,
+        n_pairs=5, entry_z=2.25, exit_z=0.25, stop_z=3.5,
+        p_value_threshold=0.05, min_corr=0.5, min_r2=0.80, tc_bps=10.0,
+        restrict_same_sector=True,
+        recent_p_value_threshold=0.10,
+        min_half_life=2.0, max_half_life=60.0, min_mean_crossings=4,
+        reentry_z=1.0, max_holding_days=60,
     )
     meta = Metadata()   # static sector map; add mcap / fundamentals / ipo for those filters
 
@@ -789,14 +887,14 @@ if __name__ == "__main__":
     # --- ablation across the proposal's variants (reuses pre-COVID prices) ---
     px, vx = pre["prices"], pre["vix"]
     variants = {
-        "coint/equal":        replace(base),
-        "distance/equal":     replace(base, method="distance"),
-        "correlation/equal":  replace(base, method="correlation"),
-        "coint/same-sector":  replace(base, restrict_same_sector=True),
-        "coint/pca-cluster":  replace(base, restrict_pca_cluster=True),
-        "coint/dynamic":      replace(base, allocation="dynamic"),
-        "coint/garch":        replace(base, allocation="garch"),
-        "coint/vix-adjust":   replace(base, vix_adjust=True),
+        "correlation/dynamic": replace(base),
+        "correlation/equal":  replace(base, allocation="equal"),
+        "coint/equal":        replace(base, method="cointegration", allocation="equal"),
+        "distance/equal":     replace(base, method="distance", allocation="equal"),
+        "corr/all-sectors":   replace(base, restrict_same_sector=False),
+        "corr/pca-cluster":   replace(base, restrict_pca_cluster=True),
+        "corr/garch":         replace(base, allocation="garch"),
+        "corr/vix-adjust":    replace(base, vix_adjust=True),
     }
     # VIX needed only for the vix-adjust variant:
     vx = vx if vx is not None else download_vix("2015-01-01", "2019-12-31")
@@ -806,7 +904,7 @@ if __name__ == "__main__":
     print(comp.to_string())
 
     # --- charts + results workbook ---
-    plot_backtest(pre, "Pairs Trading - Cointegration / Equal (pre-COVID)", "backtest_overview.png")
+    plot_backtest(pre, "Pairs Trading - Correlation / Dynamic (pre-COVID)", "backtest_overview.png")
     plot_comparison(var_res, variants, comp, "variant_comparison.png")
     plot_pair_heatmap(pre["selections"], "pair_selection_heatmap.png")
     # sweep = parameter_sweep(px, base, meta)                  # optional (6.4); slow

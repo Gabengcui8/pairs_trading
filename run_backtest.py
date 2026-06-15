@@ -63,10 +63,14 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
     base = pt.Config(
-        method="cointegration", allocation="equal",
+        method="correlation", allocation="dynamic",
         formation_days=252, trading_days=126, step_days=126,
-        n_pairs=10, entry_z=2.0, exit_z=0.0, stop_z=3.0,
-        p_value_threshold=0.05, min_corr=0.5, tc_bps=10.0,
+        n_pairs=5, entry_z=2.25, exit_z=0.25, stop_z=3.5,
+        p_value_threshold=0.05, min_corr=0.5, min_r2=0.80, tc_bps=10.0,
+        restrict_same_sector=True,
+        recent_p_value_threshold=0.10,
+        min_half_life=2.0, max_half_life=60.0, min_mean_crossings=4,
+        reentry_z=1.0, max_holding_days=60,
     )
     meta = load_metadata()
 
@@ -90,12 +94,12 @@ def main():
 
     # ----- variant ablation on pre-COVID prices (sections 6.2 / 6.3 / 6.5 / 6.4) -----
     variants = {
-        "coint/equal":       replace(base),
-        "distance/equal":    replace(base, method="distance"),
-        "correlation/equal": replace(base, method="correlation"),
-        "same-sector":       replace(base, restrict_same_sector=True),
+        "correlation/dynamic": replace(base),
+        "correlation/equal": replace(base, allocation="equal"),
+        "cointegration/equal": replace(base, method="cointegration", allocation="equal"),
+        "distance/equal":    replace(base, method="distance", allocation="equal"),
+        "all-sectors":       replace(base, restrict_same_sector=False),
         "pca-cluster":       replace(base, restrict_pca_cluster=True),
-        "dynamic-alloc":     replace(base, allocation="dynamic"),
         "garch-alloc":       replace(base, allocation="garch"),
         "vix-adjust":        replace(base, vix_adjust=True),
     }
@@ -109,7 +113,7 @@ def main():
     sweep = None
 
     # ----- charts + workbook -----
-    pt.plot_backtest(base_pre_res, "Pairs Trading - Cointegration / Equal (pre-COVID)",
+    pt.plot_backtest(base_pre_res, "Pairs Trading - Correlation / Dynamic (pre-COVID)",
                      os.path.join(OUT_DIR, "backtest_overview.png"))
     pt.plot_comparison(var_res, variants, comp,
                        os.path.join(OUT_DIR, "variant_comparison.png"))
