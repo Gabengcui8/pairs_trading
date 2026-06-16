@@ -46,11 +46,16 @@ def load_metadata() -> pt.Metadata:
         return pd.read_csv(p, index_col=0).iloc[:, col].to_dict() if os.path.exists(p) else {}
 
     sectors = _read_map("sectors.csv") or dict(pt.GICS_SECTOR)
+    industries = _read_map("industries.csv")
     mcap = _read_map("mcap.csv")
     funda_path = os.path.join(DATA_DIR, "fundamentals.csv")
     funda = pd.read_csv(funda_path, index_col=0) if os.path.exists(funda_path) else pd.DataFrame()
     ipo = _read_map("ipo.csv")
-    return pt.Metadata(sectors=sectors, mcap=mcap, ipo_year=ipo, fundamentals=funda)
+    membership_path = os.path.join(DATA_DIR, "membership.csv")
+    membership = (pd.read_csv(membership_path, parse_dates=["start", "end"])
+                  if os.path.exists(membership_path) else pd.DataFrame())
+    return pt.Metadata(sectors=sectors, industries=industries, mcap=mcap, ipo_year=ipo,
+                       fundamentals=funda, membership=membership)
 
 
 # =============================================================================
@@ -62,48 +67,73 @@ def main():
         return
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    base = pt.Config(
-        method="correlation", allocation="dynamic",
-        formation_days=252, trading_days=126, step_days=126,
-        n_pairs=5, entry_z=2.25, exit_z=0.25, stop_z=3.5,
-        p_value_threshold=0.05, min_corr=0.5, min_r2=0.80, tc_bps=10.0,
-        restrict_same_sector=True,
-        recent_p_value_threshold=0.10,
-        min_half_life=2.0, max_half_life=60.0, min_mean_crossings=4,
-        reentry_z=1.0, max_holding_days=60,
-    )
     meta = load_metadata()
+    configs = {
+        "proposal_baseline": pt.proposal_baseline_config(),
+        "optimized_equal_1x": pt.optimized_proposal_config(),
+        "optimized_aggressive_3x": pt.optimized_aggressive_config(),
+        "optimized_vol_target_garch": pt.optimized_vol_target_config(),
+        "optimized_vol_target_garch_20bps": pt.optimized_vol_target_config(tc_bps=20.0),
+    }
 
-    # ----- base strategy on both regimes -----
-    perfs = {}
-    base_pre_res = None
-    for label in ("pre", "post"):
+    # ----- strict proposal baseline + validated optimized variants -----
+    period_results = {}
+    period_perfs = {}
+    optimized_pre_res = None
+    labels = [label for label in ("pre", "post", "recent")
+              if os.path.exists(os.path.join(DATA_DIR, f"prices_{label}.csv"))]
+    for label in labels:
         px = load_prices(label)
         vix = load_vix(label)
-        res = pt.run_strategy(px, base, meta, vix)
-        perf = pt.performance_metrics(res["returns"], base)
-        perfs[label] = perf
+        period_results[label] = pt.run_configs(px, configs, meta, vix)
+        period_perfs[label] = {
+            name: pt.performance_metrics(result["returns"], configs[name])
+            for name, result in period_results[label].items()
+        }
         if label == "pre":
-            base_pre_res, pre_px, pre_vix = res, px, vix
-        print(f"\n=== {label.upper()}-COVID ({base.method}/{base.allocation}) ===")
-        for k, v in perf.items():
-            print(f"  {k:16s}: {v:,.4f}" if isinstance(v, float) else f"  {k:16s}: {v}")
+            optimized_pre_res, pre_px, pre_vix = (
+                period_results[label]["optimized_vol_target_garch"], px, vix)
 
-    print("\n=== PRE vs POST-COVID ===")
-    print(pd.DataFrame({"Pre-COVID": perfs["pre"], "Post-COVID": perfs["post"]}).round(4).to_string())
+        print(f"\n=== {label.upper()} RESULTS ===")
+        print(pd.DataFrame(period_perfs[label]).round(4).to_string())
+
+    print("\n=== PERIOD COMPARISON ===")
+    for name in configs:
+        table = pd.DataFrame({
+            label.upper(): period_perfs[label][name] for label in labels
+        })
+        print(f"\n{name}")
+        print(table.round(4).to_string())
 
     # ----- variant ablation on pre-COVID prices (sections 6.2 / 6.3 / 6.5 / 6.4) -----
+    base = pt.optimized_proposal_config()
     variants = {
-        "correlation/dynamic": replace(base),
-        "correlation/equal": replace(base, allocation="equal"),
-        "cointegration/equal": replace(base, method="cointegration", allocation="equal"),
-        "distance/equal":    replace(base, method="distance", allocation="equal"),
-        "all-sectors":       replace(base, restrict_same_sector=False),
-        "pca-cluster":       replace(base, restrict_pca_cluster=True),
-        "garch-alloc":       replace(base, allocation="garch"),
-        "vix-adjust":        replace(base, vix_adjust=True),
+        "optimized_equal_1x": base,
+        "optimized_aggressive_3x": pt.optimized_aggressive_config(),
+        "optimized_vol_target_garch": pt.optimized_vol_target_config(),
+        "optimized_vol_target_garch_20bps": pt.optimized_vol_target_config(tc_bps=20.0),
+        "proposal_baseline": configs["proposal_baseline"],
+        "proposal_n5_dynamic": pt.optimized_proposal_config(n_pairs=5, allocation="dynamic"),
+        "distance_same_industry": replace(base, method="distance"),
+        "correlation_log_ratio": replace(
+            base,
+            method="correlation",
+            correlation_on_returns=True,
+            correlation_spread_mode="log_ratio",
+            min_r2=0.25,
+            min_recent_corr=0.30,
+            require_spread_reversion=True,
+        ),
     }
-    var_res = pt.run_configs(pre_px, variants, meta, pre_vix)
+    var_res = {
+        "optimized_vol_target_garch": optimized_pre_res,
+        **{name: period_results["pre"][name]
+           for name in ("optimized_equal_1x", "optimized_aggressive_3x",
+                        "optimized_vol_target_garch_20bps",
+                        "proposal_baseline")},
+    }
+    missing = {k: v for k, v in variants.items() if k not in var_res}
+    var_res.update(pt.run_configs(pre_px, missing, meta, pre_vix))
     comp = pt.compare_configs(pre_px, variants, meta, pre_vix, results=var_res)
     print("\n=== VARIANT COMPARISON (pre-COVID) ===")
     print(comp.to_string())
@@ -113,14 +143,15 @@ def main():
     sweep = None
 
     # ----- charts + workbook -----
-    pt.plot_backtest(base_pre_res, "Pairs Trading - Correlation / Dynamic (pre-COVID)",
+    pt.plot_backtest(optimized_pre_res,
+                     "Pairs Trading - Optimized GARCH Vol-Target Cointegration (pre-COVID)",
                      os.path.join(OUT_DIR, "backtest_overview.png"))
     pt.plot_comparison(var_res, variants, comp,
                        os.path.join(OUT_DIR, "variant_comparison.png"))
-    pt.plot_pair_heatmap(base_pre_res["selections"],
+    pt.plot_pair_heatmap(optimized_pre_res["selections"],
                          os.path.join(OUT_DIR, "pair_selection_heatmap.png"))
     pt.export_excel(os.path.join(OUT_DIR, "pairs_backtest_results.xlsx"),
-                    comp, base_pre_res, sweep_df=sweep)
+                    comp, optimized_pre_res, sweep_df=sweep)
 
     print(f"\nSaved charts + workbook to ./{OUT_DIR}/")
 

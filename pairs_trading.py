@@ -15,7 +15,7 @@ variant listed in the project proposal (section 6), all driven by `Config`:
   6.4 Trading parameters .... N pairs, entry / exit / stop thresholds,
                               daily vs VIX-adjusted entry (trade more when calm)
   6.5 Capital allocation .... fixed equal | dynamic (concentrate when in cash)
-                              | GARCH inverse-volatility
+                              | GARCH inverse-volatility | volatility targeting
 
 Pipeline (per rolling window):
     build candidates -> apply restrictions -> rank & pick top-N -> z-score
@@ -42,6 +42,7 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from statsmodels.tsa.adfvalues import mackinnonp
 from statsmodels.tsa.stattools import coint
 
 warnings.filterwarnings("ignore")
@@ -66,19 +67,39 @@ class Config:
     # --- 6.2 pair-selection method ---
     method: str = "cointegration"    # "cointegration" | "distance" | "correlation"
     p_value_threshold: float = 0.05  # cointegration significance
+    cointegration_robustness: bool = False
+    coint_maxlag: int = 1
+    coint_autolag: str = None
+    fast_cointegration: bool = True
+    test_both_directions: bool = False
     recent_p_value_threshold: float = 0.10
     recent_fraction: float = 0.50    # confirm coint on latest formation data
     min_r2: float = 0.80             # correlation-method minimum R^2
+    correlation_on_returns: bool = False
+    correlation_spread_mode: str = "ols"  # "ols" | "log_ratio" | "normalized"
+    min_recent_corr: float = 0.0
+    recent_corr_days: int = 63
+    require_spread_reversion: bool = False
+    max_beta_drift: float = np.inf   # relative first-half vs second-half beta
+    validation_fraction: float = 0.0 # 0 disables formation holdout validation
+    validation_pool_size: int = 200  # validate only strongest raw candidates
+    min_validation_return: float = -np.inf
+    min_validation_trades: int = 0
+    rank_by_validation: bool = False
     n_pairs: int = 10                # top-N pairs
+    max_pairs_per_asset: int = 0     # 0 = unlimited
+    max_pairs_per_sector: int = 0    # 0 = unlimited
     min_corr: float = 0.50           # cheap pre-filter before the slow coint test
     require_positive_beta: bool = True
     use_log_prices: bool = False     # optional proportional spread for equities
     min_half_life: float = 2.0
     max_half_life: float = 60.0
     min_mean_crossings: int = 4
+    n_jobs: int = 1                  # -1 = all cores for pair tests
 
     # --- 6.3 pair restrictions (each independently toggleable) ---
     restrict_same_sector: bool = False
+    restrict_same_industry: bool = False
     restrict_mcap: bool = False
     mcap_log_tol: float = 0.75       # |ln(mcap_a) - ln(mcap_b)| <= tol
     restrict_age: bool = False
@@ -93,16 +114,28 @@ class Config:
     exit_z: float = 0.0
     stop_z: float = 3.0
     reentry_z: float = 1.0           # re-arm after a stopped spread normalises
-    max_holding_days: int = 60
+    rearm_after_stop: bool = False
+    max_holding_days: int = 0        # 0 disables time exit
+    zscore_lookback: int = 0         # 0 = fixed formation mean/std
     vix_adjust: bool = False         # scale entry threshold by VIX regime
     vix_scale_lo: float = 0.6        # calm  -> lower threshold -> trade more
     vix_scale_hi: float = 1.4        # turbulent -> higher threshold
+    max_vix_ratio: float = np.inf    # block entries above VIX/form median
+    position_sizing: str = "unit"    # "unit" | "zscore"
+    max_position_scale: float = 1.0  # cap for zscore sizing
 
     # --- 6.5 capital allocation ---
     allocation: str = "equal"        # "equal" | "dynamic" | "garch"
+    vol_target_ann: float = 0.0      # 0 disables trailing volatility targeting
+    vol_target_lookback: int = 60
+    vol_target_min_periods: int = 20
+    vol_target_max_scale: float = np.inf
 
     # --- costs & accounting ---
     tc_bps: float = 10.0             # per leg, per trade (round-trip = 2 legs)
+    gross_leverage: float = 1.0
+    short_borrow_bps_ann: float = 0.0
+    financing_bps_ann: float = 0.0   # charged on gross exposure above 1x
     ann_factor: int = 252
 
 
@@ -167,9 +200,23 @@ class Metadata:
                      ['profitability', 'gross_margin', 'cfo']  (corporate screen)
     """
     sectors: dict = field(default_factory=lambda: dict(GICS_SECTOR))
+    industries: dict = field(default_factory=dict)
     mcap: dict = field(default_factory=dict)
     ipo_year: dict = field(default_factory=dict)
     fundamentals: pd.DataFrame = field(default_factory=pd.DataFrame)
+    membership: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    def members_at(self, date) -> set:
+        """Point-in-time members at `date`; empty means no membership filter."""
+        if self.membership.empty:
+            return set()
+        m = self.membership.copy()
+        if "ticker" not in m.columns:
+            m = m.reset_index().rename(columns={m.index.name or "index": "ticker"})
+        start = pd.to_datetime(m["start"], errors="coerce")
+        end = pd.to_datetime(m["end"], errors="coerce").fillna(pd.Timestamp.max)
+        mask = start.le(pd.Timestamp(date)) & end.ge(pd.Timestamp(date))
+        return set(m.loc[mask, "ticker"].astype(str))
 
 
 def load_universe(name: str) -> list:
@@ -226,7 +273,14 @@ def build_candidates(form_prices: pd.DataFrame, cfg: Config, meta: Metadata,
                      formation_year: int) -> list:
     """All eligible (a, b) pairs after every enabled 6.3 restriction."""
     # drop degenerate series (constant over the window -> no tradeable spread)
-    names = [c for c in form_prices.columns if form_prices[c].std() > 0]
+    names = [c for c in form_prices.columns
+             if form_prices[c].notna().mean() >= 0.95
+             and pd.notna(form_prices[c].iloc[0])
+             and pd.notna(form_prices[c].iloc[-1])
+             and form_prices[c].ffill().std() > 0]
+    members = meta.members_at(form_prices.index[-1])
+    if members:
+        names = [c for c in names if c in members]
 
     # company-age screen: enough listing history before the formation window
     if cfg.restrict_age:
@@ -253,6 +307,10 @@ def build_candidates(form_prices: pd.DataFrame, cfg: Config, meta: Metadata,
     for a, b in combinations(names, 2):
         if cfg.restrict_same_sector and meta.sectors.get(a) != meta.sectors.get(b):
             continue
+        if cfg.restrict_same_industry:
+            ia, ib = meta.industries.get(a), meta.industries.get(b)
+            if ia is None or ib is None or ia != ib:
+                continue
         if cfg.restrict_mcap and meta.mcap:
             ma, mb = meta.mcap.get(a), meta.mcap.get(b)
             if ma is None or mb is None or abs(np.log(ma) - np.log(mb)) > cfg.mcap_log_tol:
@@ -275,21 +333,79 @@ def estimate_hedge_ratio(y: pd.Series, x: pd.Series):
     return float(res.params[0]), float(res.params[1])
 
 
+def fast_coint(y: pd.Series, x: pd.Series, maxlag: int = 1):
+    """
+    Fast Engle-Granger with fixed-lag ADF.
+
+    Matches statsmodels.coint(..., trend="c", autolag=None) without building
+    statsmodels result objects for every pair.
+    """
+    yv = np.asarray(y, dtype=float)
+    xv = np.asarray(x, dtype=float)
+    if len(yv) != len(xv) or len(yv) <= maxlag + 3:
+        return np.nan, np.nan
+    if not (np.isfinite(yv).all() and np.isfinite(xv).all()):
+        return np.nan, np.nan
+
+    xc = xv - xv.mean()
+    yc = yv - yv.mean()
+    xx = float(xc @ xc)
+    if xx <= 0:
+        return np.nan, np.nan
+    beta = float(xc @ yc) / xx
+    alpha = float(yv.mean() - beta * xv.mean())
+    resid = yv - alpha - beta * xv
+
+    tss = float(yc @ yc)
+    rss = float(resid @ resid)
+    if tss > 0 and 1.0 - rss / tss >= 1.0 - 100 * np.sqrt(np.finfo(float).eps):
+        return -np.inf, 0.0
+
+    delta = np.diff(resid)
+    dep = delta[maxlag:]
+    level = resid[maxlag:-1]
+    cols = [level]
+    for lag in range(1, maxlag + 1):
+        cols.append(delta[maxlag - lag:-lag])
+    design = np.column_stack(cols)
+    try:
+        params, _, _, _ = np.linalg.lstsq(design, dep, rcond=None)
+        errors = dep - design @ params
+        dof = len(dep) - design.shape[1]
+        if dof <= 0:
+            return np.nan, np.nan
+        sigma2 = float(errors @ errors) / dof
+        cov = sigma2 * np.linalg.pinv(design.T @ design)
+        se = float(np.sqrt(max(cov[0, 0], 0.0)))
+        stat = float(params[0] / se) if se > 0 else -np.inf
+    except np.linalg.LinAlgError:
+        return np.nan, np.nan
+    return stat, float(mackinnonp(stat, regression="c", N=2))
+
+
+def cointegration_test(y: pd.Series, x: pd.Series, cfg: Config):
+    if cfg.fast_cointegration and cfg.coint_autolag is None:
+        return fast_coint(y, x, maxlag=cfg.coint_maxlag)
+    stat, pvalue, _ = coint(
+        y, x, maxlag=cfg.coint_maxlag, autolag=cfg.coint_autolag)
+    return float(stat), float(pvalue)
+
+
 def spread_diagnostics(spread: pd.Series) -> dict:
     """Formation-only mean-reversion diagnostics for pair selection."""
     s = spread.dropna().astype(float)
     if len(s) < 20 or s.std() == 0:
         return {"half_life": np.inf, "mean_crossings": 0}
 
-    reg = pd.concat([
-        s.diff().rename("delta"),
-        s.shift(1).rename("lag"),
-    ], axis=1).dropna()
-    try:
-        gamma = float(sm.OLS(reg["delta"], sm.add_constant(reg["lag"])).fit().params["lag"])
-        half_life = -np.log(2) / gamma if gamma < 0 else np.inf
-    except Exception:
-        half_life = np.inf
+    values = s.to_numpy(dtype=float)
+    lag = values[:-1]
+    delta = np.diff(values)
+    lag_c = lag - lag.mean()
+    denom = float(lag_c @ lag_c)
+    gamma = (float(lag_c @ (delta - delta.mean())) / denom
+             if denom > 0 else np.nan)
+    half_life = (-np.log(2) / gamma
+                 if np.isfinite(gamma) and gamma < 0 else np.inf)
 
     centred = s - s.mean()
     signs = np.sign(centred).replace(0, np.nan).ffill().bfill()
@@ -297,7 +413,8 @@ def spread_diagnostics(spread: pd.Series) -> dict:
     return {"half_life": float(half_life), "mean_crossings": max(crossings, 0)}
 
 
-def select_pairs(form: pd.DataFrame, candidates: list, cfg: Config) -> list:
+def select_pairs(form: pd.DataFrame, candidates: list, cfg: Config,
+                 meta: Metadata = None) -> list:
     """
     Rank candidate pairs by the chosen method and return the top-N as records.
     Each record carries the info needed to form its trading spread later:
@@ -306,6 +423,20 @@ def select_pairs(form: pd.DataFrame, candidates: list, cfg: Config) -> list:
       weight_mode 'dollar_equal' (distance): hold $1 long / $1 short on prices
                   normalised to the formation start; spread = nA - nB.
     """
+    if cfg.method == "cointegration" and cfg.n_jobs != 1:
+        from joblib import Parallel, delayed
+
+        def evaluate(pair):
+            local_cfg = replace(cfg, n_jobs=1, n_pairs=1)
+            result = select_pairs(form, [pair], local_cfg, meta)
+            return result[0] if result else None
+
+        tested = Parallel(n_jobs=cfg.n_jobs, prefer="threads")(
+            delayed(evaluate)(pair) for pair in candidates)
+        recs = [rec for rec in tested if rec is not None]
+        recs.sort(key=lambda r: r["score"])
+        return apply_pair_caps(recs, cfg, meta)
+
     recs = []
     for a, b in candidates:
         if cfg.method == "cointegration":
@@ -314,11 +445,10 @@ def select_pairs(form: pd.DataFrame, candidates: list, cfg: Config) -> list:
             if abs(float(sa.corr(sb))) < cfg.min_corr:
                 continue
 
-            # Engle-Granger is asymmetric. Test both orientations and retain
-            # the more strongly cointegrated residual without using trade data.
             try:
-                _, p_ab, _ = coint(sa, sb)
-                _, p_ba, _ = coint(sb, sa)
+                _, p_ab = cointegration_test(sa, sb, cfg)
+                p_ba = (cointegration_test(sb, sa, cfg)[1]
+                        if cfg.test_both_directions else np.inf)
             except Exception:
                 continue
             if p_ba < p_ab:
@@ -331,22 +461,25 @@ def select_pairs(form: pd.DataFrame, candidates: list, cfg: Config) -> list:
             if cfg.require_positive_beta and beta <= 0:
                 continue
 
-            recent_n = min(len(form), max(60, int(len(form) * cfg.recent_fraction)))
-            try:
-                _, recent_pval, _ = coint(sa.iloc[-recent_n:], sb.iloc[-recent_n:])
-            except Exception:
-                continue
-            if recent_pval >= cfg.recent_p_value_threshold:
-                continue
-
             spread = sa - alpha - beta * sb
             diag = spread_diagnostics(spread)
-            if not (cfg.min_half_life <= diag["half_life"] <= cfg.max_half_life):
-                continue
-            if diag["mean_crossings"] < cfg.min_mean_crossings:
-                continue
+            recent_pval = np.nan
+            if cfg.cointegration_robustness:
+                recent_n = min(len(form), max(60, int(len(form) * cfg.recent_fraction)))
+                try:
+                    _, recent_pval = cointegration_test(
+                        sa.iloc[-recent_n:], sb.iloc[-recent_n:], cfg)
+                except Exception:
+                    continue
+                if recent_pval >= cfg.recent_p_value_threshold:
+                    continue
+                if not (cfg.min_half_life <= diag["half_life"] <= cfg.max_half_life):
+                    continue
+                if diag["mean_crossings"] < cfg.min_mean_crossings:
+                    continue
 
-            quality = pval * (1.0 + diag["half_life"] / cfg.max_half_life)
+            quality = (pval * (1.0 + diag["half_life"] / cfg.max_half_life)
+                       if cfg.cointegration_robustness else pval)
             recs.append({"a": a, "b": b, "score": quality, "pvalue": pval,
                          "recent_pvalue": float(recent_pval), "beta": beta,
                          **diag,
@@ -357,28 +490,143 @@ def select_pairs(form: pd.DataFrame, candidates: list, cfg: Config) -> list:
         elif cfg.method == "correlation":
             sa = np.log(form[a]) if cfg.use_log_prices else form[a]
             sb = np.log(form[b]) if cfg.use_log_prices else form[b]
-            r2 = float(sa.corr(sb)) ** 2
+            if cfg.correlation_on_returns:
+                ca = np.log(form[a]).diff() if cfg.use_log_prices else form[a].pct_change()
+                cb = np.log(form[b]).diff() if cfg.use_log_prices else form[b].pct_change()
+            else:
+                ca, cb = sa, sb
+            corr = float(ca.corr(cb))
+            r2 = corr ** 2
             if r2 < cfg.min_r2:
                 continue
-            _, beta = estimate_hedge_ratio(sa, sb)
-            if cfg.require_positive_beta and beta <= 0:
+            recent_corr = float(ca.iloc[-cfg.recent_corr_days:].corr(
+                cb.iloc[-cfg.recent_corr_days:]))
+            if not np.isfinite(recent_corr) or recent_corr < cfg.min_recent_corr:
                 continue
-            recs.append({"a": a, "b": b, "score": -r2, "beta": beta,
-                         "weight_mode": ("log_beta" if cfg.use_log_prices
-                                         else "beta_shares"),
+
+            if cfg.correlation_spread_mode == "ols":
+                alpha, beta = estimate_hedge_ratio(sa, sb)
+                if cfg.require_positive_beta and beta <= 0:
+                    continue
+                mid = len(form) // 2
+                _, beta_1 = estimate_hedge_ratio(sa.iloc[:mid], sb.iloc[:mid])
+                _, beta_2 = estimate_hedge_ratio(sa.iloc[mid:], sb.iloc[mid:])
+                beta_drift = abs(beta_2 - beta_1) / max(abs(beta_1), 1e-12)
+                rec_weights = {
+                    "beta": beta,
+                    "weight_mode": ("log_beta" if cfg.use_log_prices
+                                    else "beta_shares"),
+                }
+            elif cfg.correlation_spread_mode == "log_ratio":
+                beta, beta_drift = 1.0, 0.0
+                rec_weights = {"beta": beta, "weight_mode": "log_ratio"}
+            elif cfg.correlation_spread_mode == "normalized":
+                beta, beta_drift = 1.0, 0.0
+                rec_weights = {
+                    "beta": beta,
+                    "norm_a": float(form[a].iloc[0]),
+                    "norm_b": float(form[b].iloc[0]),
+                    "weight_mode": "dollar_equal",
+                }
+            else:
+                raise ValueError(
+                    f"unknown correlation_spread_mode: {cfg.correlation_spread_mode}")
+            if beta_drift > cfg.max_beta_drift:
+                continue
+
+            spread = make_spread(form, {"a": a, "b": b, **rec_weights})
+            diag = spread_diagnostics(spread)
+            if cfg.require_spread_reversion:
+                if not (cfg.min_half_life <= diag["half_life"] <= cfg.max_half_life):
+                    continue
+                if diag["mean_crossings"] < cfg.min_mean_crossings:
+                    continue
+
+            validation = {"return": np.nan, "sharpe": np.nan, "trades": 0}
+            if cfg.validation_fraction > 0:
+                validation = formation_validation(form, a, b, cfg)
+                if (not np.isfinite(validation["return"]) or
+                        validation["return"] < cfg.min_validation_return or
+                        validation["trades"] < cfg.min_validation_trades):
+                    continue
+            score = (-validation["return"] if cfg.rank_by_validation
+                     and np.isfinite(validation["return"]) else -r2)
+            recs.append({"a": a, "b": b, "score": score,
+                         "corr": corr, "recent_corr": recent_corr,
+                         "beta_drift": float(beta_drift), **diag,
+                         "validation_return": validation["return"],
+                         "validation_sharpe": validation["sharpe"],
+                         "validation_trades": validation["trades"],
+                         **rec_weights,
                          "metric": "R2"})
 
         elif cfg.method == "distance":
             na, nb = form[a] / form[a].iloc[0], form[b] / form[b].iloc[0]
-            ssd = float(((na - nb) ** 2).sum())
+            spread = na - nb
+            ssd = float((spread ** 2).sum())
+            diag = spread_diagnostics(spread)
+            if cfg.require_spread_reversion:
+                if not (cfg.min_half_life <= diag["half_life"] <= cfg.max_half_life):
+                    continue
+                if diag["mean_crossings"] < cfg.min_mean_crossings:
+                    continue
             recs.append({"a": a, "b": b, "score": ssd,
                          "norm_a": float(form[a].iloc[0]), "norm_b": float(form[b].iloc[0]),
+                         **diag,
                          "weight_mode": "dollar_equal", "metric": "SSD"})
         else:
             raise ValueError(f"unknown method: {cfg.method}")
 
     recs.sort(key=lambda r: r["score"])      # lower score = better, for all methods
-    return recs[: cfg.n_pairs]
+    if cfg.validation_fraction > 0 and cfg.method != "correlation":
+        validated = []
+        pool = recs[:cfg.validation_pool_size]
+        for rec in pool:
+            validation = formation_validation(
+                form, rec["a"], rec["b"], cfg)
+            if (not np.isfinite(validation["return"]) or
+                    validation["return"] < cfg.min_validation_return or
+                    validation["trades"] < cfg.min_validation_trades):
+                continue
+            rec = {
+                **rec,
+                "validation_return": validation["return"],
+                "validation_sharpe": validation["sharpe"],
+                "validation_trades": validation["trades"],
+            }
+            if cfg.rank_by_validation:
+                rec["score"] = -validation["return"]
+            validated.append(rec)
+        recs = sorted(validated, key=lambda r: r["score"])
+    return apply_pair_caps(recs, cfg, meta)
+
+
+def apply_pair_caps(recs: list, cfg: Config, meta: Metadata = None) -> list:
+    """Take top-N records while enforcing optional asset/sector concentration."""
+    if cfg.max_pairs_per_asset <= 0 and cfg.max_pairs_per_sector <= 0:
+        return recs[: cfg.n_pairs]
+
+    meta = meta or Metadata()
+    selected, counts, sector_counts = [], {}, {}
+    for rec in recs:
+        a, b = rec["a"], rec["b"]
+        if cfg.max_pairs_per_asset > 0 and (
+                counts.get(a, 0) >= cfg.max_pairs_per_asset or
+                counts.get(b, 0) >= cfg.max_pairs_per_asset):
+            continue
+        sectors = {meta.sectors.get(a), meta.sectors.get(b)} - {None}
+        if cfg.max_pairs_per_sector > 0 and any(
+                sector_counts.get(sec, 0) >= cfg.max_pairs_per_sector
+                for sec in sectors):
+            continue
+        selected.append(rec)
+        counts[a] = counts.get(a, 0) + 1
+        counts[b] = counts.get(b, 0) + 1
+        for sec in sectors:
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+        if len(selected) >= cfg.n_pairs:
+            break
+    return selected
 
 
 # =============================================================================
@@ -389,6 +637,8 @@ def make_spread(prices: pd.DataFrame, rec: dict) -> pd.Series:
         return prices[rec["a"]] - rec["beta"] * prices[rec["b"]]
     if rec["weight_mode"] == "log_beta":
         return np.log(prices[rec["a"]]) - rec["beta"] * np.log(prices[rec["b"]])
+    if rec["weight_mode"] == "log_ratio":
+        return np.log(prices[rec["a"]]) - np.log(prices[rec["b"]])
     return prices[rec["a"]] / rec["norm_a"] - prices[rec["b"]] / rec["norm_b"]
 
 
@@ -442,40 +692,57 @@ def generate_positions(z: pd.Series, cfg: Config, entry=None) -> pd.Series:
                 held = 0
         elif state == 1:
             held += 1
-            stopped = zv[t] <= -cfg.stop_z or held >= cfg.max_holding_days
+            stopped = (zv[t] <= -cfg.stop_z or
+                       (cfg.max_holding_days > 0 and held >= cfg.max_holding_days))
             if zv[t] >= cfg.exit_z or stopped:
                 state = 0
-                armed = not stopped
+                armed = not (stopped and cfg.rearm_after_stop)
         elif state == -1:
             held += 1
-            stopped = zv[t] >= cfg.stop_z or held >= cfg.max_holding_days
+            stopped = (zv[t] >= cfg.stop_z or
+                       (cfg.max_holding_days > 0 and held >= cfg.max_holding_days))
             if zv[t] <= cfg.exit_z or stopped:
                 state = 0
-                armed = not stopped
-        pos[t] = state
+                armed = not (stopped and cfg.rearm_after_stop)
+        if cfg.position_sizing == "zscore" and state != 0:
+            denom = ev[t] if np.isfinite(ev[t]) and ev[t] > 0 else cfg.entry_z
+            scale = min(max(abs(zv[t]) / max(denom, 1e-12), 1.0),
+                        cfg.max_position_scale)
+            pos[t] = state * scale
+        else:
+            pos[t] = state
     return pd.Series(pos, index=z.index)
 
 
 def backtest_pair(seed_slice: pd.DataFrame, rec: dict, mu: float, sd: float,
-                  cfg: Config, entry=None) -> pd.DataFrame:
+                  cfg: Config, entry=None,
+                  formation_spread: pd.Series = None) -> pd.DataFrame:
     """
     Per-pair daily results. `seed_slice` = one seed day + the trading window
     (seed seeds pct_change and the first position; caller drops the seed row).
-    Returns columns: ret (net of cost), pos, dz (z-score change, for GARCH).
+    Returns columns: move (one-unit long-spread return), pos, and dz.
+    Portfolio allocation and transaction costs are handled jointly later so
+    changing the number of active pairs is accounted for without look-ahead.
     """
     spread = make_spread(seed_slice, rec)
-    z = (spread - mu) / sd
+    if cfg.zscore_lookback > 1 and formation_spread is not None:
+        history = pd.concat([formation_spread.iloc[:-1], spread])
+        rolling_mu = history.rolling(cfg.zscore_lookback,
+                                     min_periods=cfg.zscore_lookback).mean()
+        rolling_sd = history.rolling(cfg.zscore_lookback,
+                                     min_periods=cfg.zscore_lookback).std()
+        z = ((history - rolling_mu) / rolling_sd.replace(0, np.nan)).reindex(
+            spread.index)
+    else:
+        z = (spread - mu) / sd
     pos = generate_positions(z, cfg, entry)
 
     rA = seed_slice[rec["a"]].pct_change(fill_method=None)
     rB = seed_slice[rec["b"]].pct_change(fill_method=None)
     wA, wB = leg_weights(seed_slice, rec)
 
-    gross = pos.shift(1) * (wA * rA - wB * rB)
-    tc = cfg.tc_bps / 1e4
-    cost = pos.diff().abs() * tc * (wA.abs() + wB.abs())
     return pd.DataFrame({
-        "ret": (gross.fillna(0.0) - cost.fillna(0.0)),
+        "move": (wA * rA - wB * rB).fillna(0.0),
         "pos": pos,
         "dz": spread.diff() / sd,
     })
@@ -520,30 +787,137 @@ def _garch_vol(recs: list, form: pd.DataFrame, dz_df: pd.DataFrame) -> pd.DataFr
     return pd.DataFrame(cols)
 
 
-def allocate(ret_df: pd.DataFrame, pos_df: pd.DataFrame, dz_df: pd.DataFrame,
+def allocate(move_df: pd.DataFrame, pos_df: pd.DataFrame, dz_df: pd.DataFrame,
              cfg: Config, recs: list, form: pd.DataFrame) -> pd.Series:
-    """Combine per-pair returns into a portfolio return under the chosen scheme."""
-    if ret_df.empty:
+    """
+    Build close-to-close portfolio returns from target pair exposures.
+
+    Signals observed at close t set target exposure for t+1. Gross return on
+    day t therefore uses target exposure from t-1. Costs are charged on every
+    target change, including initial entry, dynamic reallocation, and forced
+    liquidation at the end of each trading window.
+    """
+    if move_df.empty:
         return pd.Series(dtype=float)
 
-    if cfg.allocation == "equal":                     # fixed 1/N (cash sits idle)
-        return ret_df.mul(1.0 / len(recs)).sum(axis=1)
-
     active = pos_df.abs() > 0
-    if cfg.allocation == "dynamic":                   # equal among pairs in a trade
+    if cfg.allocation == "equal":                     # fixed 1/N (cash sits idle)
+        weights = active.astype(float) / len(recs)
+    elif cfg.allocation == "dynamic":                 # equal among active pairs
         n = active.sum(axis=1).replace(0, np.nan)
-        w = active.div(n, axis=0).fillna(0.0)
-        return (ret_df * w).sum(axis=1)
-
-    if cfg.allocation == "garch":                     # inverse-vol among active pairs
-        vol = _garch_vol(recs, form, dz_df).reindex_like(ret_df)
+        weights = active.div(n, axis=0).fillna(0.0)
+    elif cfg.allocation == "garch":                   # inverse-vol among active pairs
+        vol = _garch_vol(recs, form, dz_df).reindex_like(move_df)
         inv = (1.0 / vol).replace([np.inf, -np.inf], np.nan)
         raw = inv.where(active, 0.0).fillna(0.0)
         s = raw.sum(axis=1).replace(0, np.nan)
-        w = raw.div(s, axis=0).fillna(0.0)
-        return (ret_df * w).sum(axis=1)
+        weights = raw.div(s, axis=0).fillna(0.0)
+    else:
+        raise ValueError(f"unknown allocation: {cfg.allocation}")
 
-    raise ValueError(f"unknown allocation: {cfg.allocation}")
+    target = weights * pos_df * cfg.gross_leverage
+    if cfg.vol_target_ann > 0:
+        proxy = (target.shift(1).fillna(0.0) * move_df.fillna(0.0)).sum(axis=1)
+        realised = (
+            proxy.shift(1)
+            .rolling(cfg.vol_target_lookback,
+                     min_periods=cfg.vol_target_min_periods)
+            .std()
+            * np.sqrt(cfg.ann_factor)
+        )
+        scale = (cfg.vol_target_ann / realised).replace([np.inf, -np.inf], np.nan)
+        scale = scale.clip(lower=0.0, upper=cfg.vol_target_max_scale).fillna(1.0)
+        target = target.mul(scale, axis=0)
+
+    gross = (target.shift(1).fillna(0.0) * move_df.fillna(0.0)).sum(axis=1)
+    turnover = target.diff().abs().sum(axis=1)
+    turnover.iloc[0] = target.iloc[0].abs().sum()
+    prior_gross = target.shift(1).fillna(0.0).abs().sum(axis=1)
+    borrow = (0.5 * prior_gross * cfg.short_borrow_bps_ann /
+              1e4 / cfg.ann_factor)
+    financed = (prior_gross - 1.0).clip(lower=0.0)
+    financing = financed * cfg.financing_bps_ann / 1e4 / cfg.ann_factor
+    net = gross - turnover * (cfg.tc_bps / 1e4) - borrow - financing
+
+    # The seed row represents the formation-window close. Carry its setup cost
+    # into the first reported trading day, then liquidate at the window end.
+    if len(net) > 1:
+        net.iloc[1] += net.iloc[0]
+        net = net.iloc[1:].copy()
+        net.iloc[-1] -= target.iloc[-1].abs().sum() * (cfg.tc_bps / 1e4)
+    else:
+        net = net.iloc[0:0]
+    return net
+
+
+def formation_validation(form: pd.DataFrame, a: str, b: str,
+                         cfg: Config) -> dict:
+    """Train on early formation data and validate the pair on its later part."""
+    split = int(len(form) * (1.0 - cfg.validation_fraction))
+    if split < 60 or len(form) - split < 40:
+        return {"return": np.nan, "sharpe": np.nan, "trades": 0}
+
+    train = form.iloc[:split]
+    seed_validation = form.iloc[split - 1:]
+    if cfg.method == "distance":
+        rec = {
+            "a": a, "b": b,
+            "norm_a": float(train[a].iloc[0]),
+            "norm_b": float(train[b].iloc[0]),
+            "weight_mode": "dollar_equal",
+        }
+    elif cfg.method == "cointegration":
+        sa = np.log(train[a]) if cfg.use_log_prices else train[a]
+        sb = np.log(train[b]) if cfg.use_log_prices else train[b]
+        _, beta = estimate_hedge_ratio(sa, sb)
+        if cfg.require_positive_beta and beta <= 0:
+            return {"return": np.nan, "sharpe": np.nan, "trades": 0}
+        rec = {
+            "a": a, "b": b, "beta": beta,
+            "weight_mode": "log_beta" if cfg.use_log_prices else "beta_shares",
+        }
+    elif cfg.correlation_spread_mode == "ols":
+        sa = np.log(train[a]) if cfg.use_log_prices else train[a]
+        sb = np.log(train[b]) if cfg.use_log_prices else train[b]
+        _, beta = estimate_hedge_ratio(sa, sb)
+        if cfg.require_positive_beta and beta <= 0:
+            return {"return": np.nan, "sharpe": np.nan, "trades": 0}
+        rec = {
+            "a": a, "b": b, "beta": beta,
+            "weight_mode": "log_beta" if cfg.use_log_prices else "beta_shares",
+        }
+    elif cfg.correlation_spread_mode == "log_ratio":
+        rec = {"a": a, "b": b, "beta": 1.0, "weight_mode": "log_ratio"}
+    elif cfg.correlation_spread_mode == "normalized":
+        rec = {
+            "a": a, "b": b, "beta": 1.0,
+            "norm_a": float(train[a].iloc[0]),
+            "norm_b": float(train[b].iloc[0]),
+            "weight_mode": "dollar_equal",
+        }
+    else:
+        return {"return": np.nan, "sharpe": np.nan, "trades": 0}
+    formation_spread = make_spread(train, rec)
+    sd = formation_spread.std()
+    if not np.isfinite(sd) or sd == 0:
+        return {"return": np.nan, "sharpe": np.nan, "trades": 0}
+
+    bt = backtest_pair(seed_validation, rec, formation_spread.mean(), sd, cfg,
+                       formation_spread=formation_spread)
+    key = f"{a}-{b}"
+    move_df = pd.DataFrame({key: bt["move"]})
+    pos_df = pd.DataFrame({key: bt["pos"]})
+    dz_df = pd.DataFrame({key: bt["dz"]})
+    validation_cfg = replace(cfg, allocation="equal")
+    returns = allocate(move_df, pos_df, dz_df, validation_cfg, [rec], train)
+    entries = int(((bt["pos"] != 0) & (bt["pos"].shift(1).fillna(0) == 0)).sum())
+    if returns.empty:
+        return {"return": np.nan, "sharpe": np.nan, "trades": entries}
+    total = float((1.0 + returns).prod() - 1.0)
+    vol = float(returns.std())
+    sharpe = (float(returns.mean()) / vol * np.sqrt(cfg.ann_factor)
+              if vol > 0 else np.nan)
+    return {"return": total, "sharpe": sharpe, "trades": entries}
 
 
 # =============================================================================
@@ -551,13 +925,20 @@ def allocate(ret_df: pd.DataFrame, pos_df: pd.DataFrame, dz_df: pd.DataFrame,
 # =============================================================================
 def _entry_series(seed_idx, form_idx, cfg: Config, vix: pd.Series):
     """Per-day entry threshold over the seed slice (VIX-adjusted if enabled)."""
-    if not cfg.vix_adjust or vix is None:
+    if vix is None or (not cfg.vix_adjust and not np.isfinite(cfg.max_vix_ratio)):
         return None
     ref = vix.reindex(form_idx).median()
     if not np.isfinite(ref) or ref == 0:
         return None
-    scale = (vix.reindex(seed_idx) / ref).clip(cfg.vix_scale_lo, cfg.vix_scale_hi)
-    return (cfg.entry_z * scale).fillna(cfg.entry_z).values
+    ratio = vix.reindex(seed_idx) / ref
+    if cfg.vix_adjust:
+        scale = ratio.clip(cfg.vix_scale_lo, cfg.vix_scale_hi)
+        entry = (cfg.entry_z * scale).fillna(cfg.entry_z)
+    else:
+        entry = pd.Series(cfg.entry_z, index=seed_idx, dtype=float)
+    if np.isfinite(cfg.max_vix_ratio):
+        entry = entry.mask(ratio > cfg.max_vix_ratio, np.inf)
+    return entry.values
 
 
 def run_strategy(prices: pd.DataFrame, cfg: Config,
@@ -576,7 +957,7 @@ def run_strategy(prices: pd.DataFrame, cfg: Config,
         f_year = idx[f1 - 1].year
 
         candidates = build_candidates(form, cfg, meta, f_year)
-        recs = select_pairs(form, candidates, cfg)
+        recs = select_pairs(form, candidates, cfg, meta)
         selections.append({"formation": (idx[f0], idx[f1 - 1]),
                            "trading": (idx[f1], idx[t1 - 1]),
                            "n_candidates": len(candidates),
@@ -586,24 +967,156 @@ def run_strategy(prices: pd.DataFrame, cfg: Config,
         if recs:
             seed = prices.iloc[f1 - 1:t1]
             entry = _entry_series(seed.index, form.index, cfg, vix)
-            rets, poss, dzs, kept = {}, {}, {}, []
+            moves, poss, dzs, kept = {}, {}, {}, []
             for rec in recs:
                 fs = make_spread(form, rec)
                 mu, sd = fs.mean(), fs.std()
                 if sd == 0 or np.isnan(sd):
                     continue
-                bt = backtest_pair(seed, rec, mu, sd, cfg, entry).iloc[1:]
+                bt = backtest_pair(seed, rec, mu, sd, cfg, entry, fs)
                 key = f'{rec["a"]}-{rec["b"]}'
-                rets[key], poss[key], dzs[key] = bt["ret"], bt["pos"], bt["dz"]
+                moves[key], poss[key], dzs[key] = bt["move"], bt["pos"], bt["dz"]
                 kept.append(rec)
             if kept:
-                ret_df = pd.DataFrame(rets); pos_df = pd.DataFrame(poss); dz_df = pd.DataFrame(dzs)
-                w = allocate(ret_df, pos_df, dz_df, cfg, kept, form)
+                move_df = pd.DataFrame(moves)
+                pos_df = pd.DataFrame(poss)
+                dz_df = pd.DataFrame(dzs)
+                w = allocate(move_df, pos_df, dz_df, cfg, kept, form)
                 port.loc[w.index] = w.values
 
         start += cfg.step_days
 
     return {"returns": port, "selections": selections}
+
+
+def run_ensemble(prices: pd.DataFrame, configs: dict,
+                 meta: Metadata = None, vix: pd.Series = None,
+                 weights: dict = None) -> dict:
+    """Combine independently costed strategy models with fixed capital weights."""
+    if not configs:
+        return {"returns": pd.Series(0.0, index=prices.index),
+                "selections": [], "model_results": {}}
+    model_results = run_configs(prices, configs, meta, vix)
+    if weights is None:
+        weights = {name: 1.0 for name in configs}
+    total = sum(max(float(weights.get(name, 0.0)), 0.0) for name in configs)
+    if total <= 0:
+        raise ValueError("ensemble weights must contain a positive value")
+    norm = {name: max(float(weights.get(name, 0.0)), 0.0) / total
+            for name in configs}
+    returns = sum(model_results[name]["returns"] * norm[name]
+                  for name in configs)
+
+    merged = []
+    max_windows = max(len(r["selections"]) for r in model_results.values())
+    for i in range(max_windows):
+        available = [r["selections"][i] for r in model_results.values()
+                     if i < len(r["selections"])]
+        pairs = sorted({pair for selection in available
+                        for pair in selection["pairs"]})
+        merged.append({
+            "formation": available[0]["formation"],
+            "trading": available[0]["trading"],
+            "n_candidates": max(s["n_candidates"] for s in available),
+            "n_selected": len(pairs),
+            "pairs": pairs,
+        })
+    return {"returns": returns, "selections": merged,
+            "model_results": model_results, "model_weights": norm}
+
+
+def default_ensemble_configs(base: Config) -> dict:
+    """Two fixed spread constructions used by the robust default runner."""
+    return {
+        "ols": replace(base, correlation_spread_mode="ols"),
+        "log-ratio": replace(base, correlation_spread_mode="log_ratio"),
+    }
+
+
+def proposal_baseline_config(**overrides) -> Config:
+    """Exact primary specification from the Group 9 project proposal."""
+    cfg = Config(
+        universe="sp500",
+        method="cointegration",
+        formation_days=252,
+        trading_days=126,
+        step_days=126,
+        p_value_threshold=0.05,
+        cointegration_robustness=False,
+        n_pairs=10,
+        min_corr=-1.0,               # test every eligible pair
+        require_positive_beta=False,
+        restrict_same_sector=False,
+        entry_z=2.0,
+        exit_z=0.0,
+        stop_z=3.0,
+        rearm_after_stop=False,
+        max_holding_days=0,
+        allocation="equal",
+        tc_bps=10.0,
+        gross_leverage=1.0,
+        short_borrow_bps_ann=0.0,
+        financing_bps_ann=0.0,
+        n_jobs=1,
+    )
+    return replace(cfg, **overrides)
+
+
+def optimized_proposal_config(**overrides) -> Config:
+    """
+    Cost-aware optimized specification that keeps the proposal's core logic:
+    Engle-Granger cointegration, 12m/6m rolling windows, z-score entries,
+    stop losses, VIX gating, and equal capital allocation.
+    """
+    cfg = proposal_baseline_config(
+        method="cointegration",
+        restrict_same_sector=True,
+        restrict_same_industry=True,
+        require_positive_beta=True,
+        use_log_prices=True,
+        min_corr=0.50,
+        p_value_threshold=0.01,
+        n_pairs=3,
+        entry_z=2.0,
+        exit_z=0.0,
+        stop_z=3.5,
+        rearm_after_stop=True,
+        reentry_z=1.0,
+        max_holding_days=60,
+        max_pairs_per_asset=2,
+        max_vix_ratio=1.5,
+        allocation="equal",
+    )
+    return replace(cfg, **overrides)
+
+
+def optimized_aggressive_config(**overrides) -> Config:
+    """
+    Higher-deployment version of the optimized proposal strategy.
+
+    gross_leverage=3.0 means a market-neutral book can deploy about 150% long
+    and 150% short gross exposure. This is more aggressive than the conservative
+    1x setting, but keeps the same pair-selection and trading rules.
+    """
+    cfg = optimized_proposal_config(gross_leverage=3.0)
+    return replace(cfg, **overrides)
+
+
+def optimized_vol_target_config(**overrides) -> Config:
+    """
+    Main optimized specification for the report-quality run.
+
+    It keeps the proposal's Engle-Granger pair selection and z-score trading
+    rules, then uses the section-6.5 GARCH allocation plus a trailing portfolio
+    volatility target. The scale cap keeps the book from becoming an unlimited
+    leverage exercise during quiet windows.
+    """
+    cfg = optimized_proposal_config(
+        allocation="garch",
+        vol_target_ann=0.15,
+        vol_target_max_scale=3.0,
+    )
+    return replace(cfg, **overrides)
 
 
 # =============================================================================
@@ -867,44 +1380,59 @@ def run_period(label, start, end, base, meta=None, vix=None, verbose=True):
 
 if __name__ == "__main__":
     base = Config(
-        universe="sp500", method="correlation", allocation="dynamic",
+        universe="sp500", method="correlation", allocation="equal",
         formation_days=252, trading_days=126, step_days=126,
-        n_pairs=5, entry_z=2.25, exit_z=0.25, stop_z=3.5,
-        p_value_threshold=0.05, min_corr=0.5, min_r2=0.80, tc_bps=10.0,
+        n_pairs=5, entry_z=2.75, exit_z=0.25, stop_z=3.5,
+        min_r2=0.25, tc_bps=10.0,
         restrict_same_sector=True,
-        recent_p_value_threshold=0.10,
-        min_half_life=2.0, max_half_life=60.0, min_mean_crossings=4,
+        correlation_on_returns=True, min_recent_corr=0.30,
+        max_pairs_per_asset=2, max_pairs_per_sector=3,
+        require_spread_reversion=True, max_beta_drift=1.0,
         reentry_z=1.0, max_holding_days=60,
+        short_borrow_bps_ann=50.0, financing_bps_ann=500.0,
     )
     meta = Metadata()   # static sector map; add mcap / fundamentals / ipo for those filters
 
-    # --- base strategy, both regimes ---
-    pre  = run_period("PRE-COVID",  "2015-01-01", "2019-12-31", base, meta)
-    post = run_period("POST-COVID", "2022-01-01", "2024-12-31", base, meta)
+    # --- robust two-model ensemble, both regimes ---
+    periods = {
+        "PRE-COVID": ("2015-01-01", "2019-12-31"),
+        "POST-COVID": ("2022-01-01", "2024-12-31"),
+    }
+    runs = {}
+    for label, (start, end) in periods.items():
+        tickers = base.tickers or load_universe(base.universe)
+        prices = download_prices(tickers, start, end)
+        result = run_ensemble(prices, default_ensemble_configs(base), meta)
+        result["prices"] = prices
+        result["perf"] = performance_metrics(result["returns"], base)
+        runs[label] = result
+        print(f"\n{'='*62}\n{label}: {start} -> {end}  "
+              f"[correlation ensemble | allocation=equal]\n{'='*62}")
+        for k, v in result["perf"].items():
+            print(f"  {k:16s}: {v:,.4f}" if isinstance(v, float)
+                  else f"  {k:16s}: {v}")
+    pre, post = runs["PRE-COVID"], runs["POST-COVID"]
     print(f"\n{'='*62}\nPRE vs POST-COVID\n{'='*62}")
     print(pd.DataFrame({"Pre-COVID": pre["perf"], "Post-COVID": post["perf"]}).round(4).to_string())
 
     # --- ablation across the proposal's variants (reuses pre-COVID prices) ---
-    px, vx = pre["prices"], pre["vix"]
+    px, vx = pre["prices"], None
     variants = {
-        "correlation/dynamic": replace(base),
-        "correlation/equal":  replace(base, allocation="equal"),
+        "correlation/ols":     replace(base, correlation_spread_mode="ols"),
+        "correlation/log-ratio": replace(base, correlation_spread_mode="log_ratio"),
         "coint/equal":        replace(base, method="cointegration", allocation="equal"),
         "distance/equal":     replace(base, method="distance", allocation="equal"),
         "corr/all-sectors":   replace(base, restrict_same_sector=False),
-        "corr/pca-cluster":   replace(base, restrict_pca_cluster=True),
-        "corr/garch":         replace(base, allocation="garch"),
-        "corr/vix-adjust":    replace(base, vix_adjust=True),
     }
-    # VIX needed only for the vix-adjust variant:
-    vx = vx if vx is not None else download_vix("2015-01-01", "2019-12-31")
     var_res = run_configs(px, variants, meta, vx)              # run each variant ONCE
+    var_res = {"robust ensemble": pre, **var_res}
+    variants = {"robust ensemble": base, **variants}
     comp = compare_configs(px, variants, meta, vx, results=var_res)
     print(f"\n{'='*62}\nVARIANT COMPARISON (pre-COVID)\n{'='*62}")
     print(comp.to_string())
 
     # --- charts + results workbook ---
-    plot_backtest(pre, "Pairs Trading - Correlation / Dynamic (pre-COVID)", "backtest_overview.png")
+    plot_backtest(pre, "Pairs Trading - Robust Ensemble (pre-COVID)", "backtest_overview.png")
     plot_comparison(var_res, variants, comp, "variant_comparison.png")
     plot_pair_heatmap(pre["selections"], "pair_selection_heatmap.png")
     # sweep = parameter_sweep(px, base, meta)                  # optional (6.4); slow

@@ -22,6 +22,8 @@ Requires:  pip install yfinance pandas    (+ `wrds` only if you use the hooks)
 """
 
 import os
+from itertools import islice
+from io import StringIO
 import pandas as pd
 
 from pairs_trading import SP500_FALLBACK, ETF_UNIVERSE, GICS_SECTOR
@@ -32,6 +34,7 @@ DATA_DIR = "data"
 PERIODS = {
     "pre":  ("2015-01-01", "2019-12-31"),   # pre-COVID
     "post": ("2022-01-01", "2024-12-31"),   # post-COVID
+    "recent": ("2024-01-01", "2026-06-16"), # formation in 2024, holdout after
 }
 
 # Choose "sp500" (default) or "etf" (6.1 ETF-based pairs)
@@ -41,15 +44,63 @@ UNIVERSE = "sp500"
 # =============================================================================
 # yfinance downloads (no special access required)
 # =============================================================================
-def download_prices(tickers, start, end) -> pd.DataFrame:
-    """Daily adjusted-close prices; drops names with sparse history."""
+def normalize_ticker(ticker):
+    """Map data-vendor ticker punctuation to Yahoo Finance notation."""
+    return str(ticker).strip().upper().replace(".", "-")
+
+
+def current_sp500_constituents():
+    """
+    Current S&P 500 members and GICS sectors.
+
+    This is only a no-WRDS fallback and therefore has survivorship bias for
+    historical tests. The WRDS path below is the proposal-compliant source.
+    """
+    import requests
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    response = requests.get(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 pairs-trading-research/1.0"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    table = pd.read_html(StringIO(response.text),
+                         attrs={"id": "constituents"})[0]
+    out = table[["Symbol", "GICS Sector", "GICS Sub-Industry", "Date added"]].copy()
+    out.columns = ["ticker", "sector", "industry", "date_added"]
+    out["ticker"] = out["ticker"].map(normalize_ticker)
+    return out.drop_duplicates("ticker").sort_values("ticker")
+
+
+def _chunks(values, size):
+    it = iter(values)
+    while True:
+        chunk = list(islice(it, size))
+        if not chunk:
+            return
+        yield chunk
+
+
+def download_prices(tickers, start, end, chunk_size=75) -> pd.DataFrame:
+    """Daily adjusted closes, downloaded in chunks and kept as a sparse panel."""
     import yfinance as yf
-    raw = yf.download(tickers, start=start, end=end,
-                      auto_adjust=True, progress=False, group_by="column")
-    px = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
-    px = px.dropna(axis=1, how="all").sort_index()
-    keep = px.columns[px.notna().mean() > 0.95]
-    return px[keep].ffill().dropna(how="any")
+    frames = []
+    tickers = [normalize_ticker(t) for t in tickers]
+    for chunk in _chunks(tickers, chunk_size):
+        raw = yf.download(chunk, start=start, end=end, auto_adjust=True,
+                          progress=False, group_by="column", threads=True)
+        if raw.empty:
+            continue
+        close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+        if isinstance(close, pd.Series):
+            close = close.to_frame(name=chunk[0])
+        frames.append(close)
+    if not frames:
+        return pd.DataFrame()
+    px = pd.concat(frames, axis=1)
+    px = px.loc[:, ~px.columns.duplicated()].sort_index()
+    px.columns = [normalize_ticker(c) for c in px.columns]
+    return px.dropna(axis=1, how="all").ffill(limit=5)
 
 
 def download_vix(start, end) -> pd.Series:
@@ -82,6 +133,10 @@ def wrds_sp500_constituents(start, end):
     """
     df = db.raw_sql(q, params={"s": start, "e": end})
     db.close()
+    df = df.rename(columns={"ending": "end"})
+    df["ticker"] = df["ticker"].map(normalize_ticker)
+    df["start"] = pd.to_datetime(df["start"])
+    df["end"] = pd.to_datetime(df["end"])
     return df
 
 
@@ -136,19 +191,46 @@ def wrds_fundamentals(fyear=2018):
 # =============================================================================
 def main(use_wrds: bool = False):
     os.makedirs(DATA_DIR, exist_ok=True)
-    tickers = {"sp500": SP500_FALLBACK, "etf": ETF_UNIVERSE}[UNIVERSE]
+    tickers = ETF_UNIVERSE if UNIVERSE == "etf" else SP500_FALLBACK
 
     # ----- universe & sectors -----
-    if use_wrds:
+    if UNIVERSE == "sp500" and use_wrds:
         # Replace the fallback list with point-in-time constituents.
-        cons = wrds_sp500_constituents(*PERIODS["pre"])
+        all_start = min(start for start, _ in PERIODS.values())
+        all_end = max(end for _, end in PERIODS.values())
+        cons = wrds_sp500_constituents(all_start, all_end)
         tickers = sorted(cons["ticker"].dropna().unique().tolist())
+        cons[["ticker", "start", "end", "permno", "comnam"]].to_csv(
+            os.path.join(DATA_DIR, "membership.csv"), index=False)
         sec = wrds_sectors().dropna()
+        sec["ticker"] = sec["ticker"].map(normalize_ticker)
         pd.Series(sec.set_index("ticker")["gsector"].to_dict(), name="sector").to_csv(
             os.path.join(DATA_DIR, "sectors.csv"))
         wrds_market_cap().set_index("ticker")["mcap_busd"].rename("mcap").to_csv(
             os.path.join(DATA_DIR, "mcap.csv"))
         wrds_fundamentals().to_csv(os.path.join(DATA_DIR, "fundamentals.csv"))
+    elif UNIVERSE == "sp500":
+        try:
+            current = current_sp500_constituents()
+            tickers = current["ticker"].tolist()
+            current.to_csv(os.path.join(DATA_DIR, "universe_current.csv"), index=False)
+            current.set_index("ticker")["sector"].to_csv(
+                os.path.join(DATA_DIR, "sectors.csv"))
+            current.set_index("ticker")["industry"].to_csv(
+                os.path.join(DATA_DIR, "industries.csv"))
+            fallback_membership = current[["ticker", "date_added"]].copy()
+            fallback_membership["start"] = pd.to_datetime(
+                fallback_membership["date_added"], errors="coerce"
+            ).fillna(pd.Timestamp("1900-01-01"))
+            fallback_membership["end"] = pd.NaT
+            fallback_membership[["ticker", "start", "end"]].to_csv(
+                os.path.join(DATA_DIR, "membership.csv"), index=False)
+            print(f"using {len(tickers)} current S&P 500 symbols "
+                  "(survivorship-biased fallback; use WRDS for final study)")
+        except Exception as exc:
+            print(f"current S&P 500 download failed ({exc}); using bundled fallback")
+            pd.Series(GICS_SECTOR, name="sector").to_csv(
+                os.path.join(DATA_DIR, "sectors.csv"))
     else:
         pd.Series(GICS_SECTOR, name="sector").to_csv(os.path.join(DATA_DIR, "sectors.csv"))
 

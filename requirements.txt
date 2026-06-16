@@ -3,6 +3,7 @@ numpy>=1.24
 pandas>=2.0
 statsmodels>=0.14     # Engle-Granger cointegration, OLS hedge ratio
 yfinance>=0.2.40      # daily prices + VIX
+lxml>=5.0             # current S&P 500 fallback table
 
 # Strategy variants (section 6)
 arch>=6.3             # GARCH(1,1) volatility-based capital allocation (6.5)
