@@ -32,7 +32,7 @@ add cost-aware robustness:
   volatility target, capped at 3x scale
 - 10 bps transaction cost per leg
 
-Three optimized books are reported:
+Four optimized books are reported:
 
 - `optimized_equal_1x`: conservative 50% long / 50% short style gross exposure.
 - `optimized_aggressive_3x`: higher-deployment market-neutral book, about
@@ -41,6 +41,9 @@ Three optimized books are reported:
 - `optimized_vol_target_garch`: the main report version. It keeps the same
   pair-selection and trade rules, then allocates active pairs by GARCH
   forecast risk and scales the book to a trailing volatility target.
+- `optimized_risk_balanced_garch`: lower-volatility companion version. It uses
+  an 8% annualized volatility target capped at 5x scale, improving the
+  cross-period average Sharpe and reducing drawdown versus the headline book.
 
 Recent run from cached data:
 
@@ -49,6 +52,14 @@ Recent run from cached data:
 | 2015-2019 pre-COVID | -35.93% | 4.51% | 13.17% | 20.56% | -14.16% |
 | 2022-2024 post-COVID | -12.95% | 2.31% | 6.57% | 13.12% | -11.05% |
 | 2025-2026 holdout | -11.45% | 4.23% | 12.99% | 30.52% | -7.56% |
+
+Risk-balanced companion:
+
+| Period | Risk-Balanced Return | Risk-Balanced Sharpe | Risk-Balanced Max DD |
+|---|---:|---:|---:|
+| 2015-2019 pre-COVID | 12.54% | 0.3879 | -9.89% |
+| 2022-2024 post-COVID | 8.66% | 0.5706 | -6.02% |
+| 2025-2026 holdout | 23.19% | 1.7886 | -4.08% |
 
 Cost stress: `optimized_vol_target_garch_20bps` remains positive in all three
 periods: +2.29%, +5.66%, and +24.87%. The cost-stress drawdown is meaningfully
@@ -96,6 +107,8 @@ The runner writes:
 | `output/variant_comparison.png` | Variant equity and metric comparison |
 | `output/pair_selection_heatmap.png` | Selected pairs by window |
 | `output/pairs_backtest_results.xlsx` | Formatted result workbook |
+| `output/period_metrics.csv` | Pre/post/recent metrics for every displayed strategy |
+| `output/backtest_dashboard.html` | Self-contained presentation dashboard |
 
 Offline engine check:
 

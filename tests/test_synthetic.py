@@ -132,6 +132,9 @@ def main():
     vol_target = pt.optimized_vol_target_config()
     assert vol_target.allocation == "garch" and vol_target.vol_target_ann == 0.15
     assert vol_target.vol_target_max_scale == 3.0 and vol_target.n_pairs == 3
+    risk_balanced = pt.optimized_risk_balanced_config()
+    assert risk_balanced.allocation == "garch" and risk_balanced.vol_target_ann == 0.08
+    assert risk_balanced.vol_target_max_scale == 5.0 and risk_balanced.n_pairs == 3
 
     # Fast fixed-lag Engle-Granger matches statsmodels.
     y, x = form["A0"], form["B0"]
@@ -151,6 +154,8 @@ def main():
         "garch":        replace(base, allocation="garch"),
         "vol-target":   replace(base, allocation="garch", vol_target_ann=0.08,
                                 vol_target_max_scale=2.0),
+        "risk-balanced": pt.optimized_risk_balanced_config(
+            tickers=list(prices.columns)),
         "vix":          replace(base, vix_adjust=True),
     }
     for name, cfg in variants.items():
