@@ -23,12 +23,12 @@ Pipeline (per rolling window):
 
 DATA
 ----
-Prices: yfinance (needs internet). Point-in-time S&P 500 membership, GICS
-sectors, market cap and fundamentals should come from CRSP/Compustat via WRDS
-(hooks + documented schema below); a static large-cap fallback + real sector
-map are provided so the framework runs out of the box.
+Final-study data should come from WRDS: CRSP point-in-time S&P 500 membership
+and CRSP adjusted daily prices, plus Compustat/CRSP metadata for the optional
+firm-characteristic filters. A yfinance/Wikipedia fallback is provided only so
+the framework can run without WRDS access.
 
-Requires:  pip install yfinance statsmodels pandas numpy arch scikit-learn
+Requires:  pip install -r requirements.txt
 Run:       python pairs_trading.py
 ================================================================================
 """

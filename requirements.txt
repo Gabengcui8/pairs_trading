@@ -14,5 +14,4 @@ matplotlib>=3.7       # charts
 openpyxl>=3.1         # Excel export
 
 # Optional: point-in-time S&P 500 constituents + Compustat fundamentals
-# Only needed if you enable the WRDS hooks in download_data.py
-# wrds>=3.1
+wrds>=3.1

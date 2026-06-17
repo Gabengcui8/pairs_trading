@@ -7,20 +7,22 @@ QF621 Quantitative Trading Strategies, Group 9
 Run ONCE:   python download_data.py
 Creates a ./data folder so the backtest can run repeatedly without re-fetching:
 
-    prices_pre.csv,  prices_post.csv     daily adjusted-close (yfinance)
-    vix_pre.csv,     vix_post.csv        ^VIX close (for VIX-adjusted entry)
+    prices_pre.csv,  prices_post.csv     daily adjusted close
+                                           (CRSP/WRDS or yfinance fallback)
+    vix_pre.csv,     vix_post.csv        ^VIX close (VIX-adjusted entry)
     sectors.csv                          GICS sector per ticker (static map below)
     mcap.csv, ipo.csv, fundamentals.csv  OPTIONAL firm characteristics (WRDS)
 
 The default run uses yfinance + the bundled static sector map, so it works with
-no special access. For the REAL study, fill in the WRDS functions further down
-(point-in-time S&P 500 membership + Compustat fundamentals) using your WRDS
-login -- these avoid survivorship bias and power the 6.3 restriction filters.
+no special access. For the REAL study, run with --source wrds. That path pulls
+point-in-time S&P 500 membership and CRSP adjusted daily prices from WRDS,
+which is the proposal-compliant path for reducing survivorship bias.
 
-Requires:  pip install yfinance pandas    (+ `wrds` only if you use the hooks)
+Requires:  pip install -r requirements.txt
 ================================================================================
 """
 
+import argparse
 import os
 from itertools import islice
 from io import StringIO
@@ -111,11 +113,41 @@ def download_vix(start, end) -> pd.Series:
     return (s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s).rename("VIX")
 
 
+def _wrds_connection():
+    """Open WRDS connection with a clear install hint."""
+    try:
+        import wrds
+    except ImportError as exc:
+        raise RuntimeError(
+            "WRDS source requested but the `wrds` package is not installed. "
+            "Run `pip install wrds` or `pip install -r requirements.txt`."
+        ) from exc
+    return wrds.Connection()
+
+
+def _canonical_tickers_by_permno(constituents: pd.DataFrame) -> dict:
+    """
+    Stable ticker label per PERMNO.
+
+    CRSP stocknames can contain historical ticker changes. The backtest keys
+    membership, metadata, and prices by one column label, so each PERMNO needs a
+    canonical ticker. If two PERMNOs map to the same latest ticker, suffix the
+    PERMNO to keep columns unique.
+    """
+    latest = (
+        constituents.sort_values(["permno", "end"])
+        .drop_duplicates("permno", keep="last")
+    )
+    base = latest.set_index("permno")["ticker"].to_dict()
+    counts = pd.Series(base).value_counts()
+    return {
+        permno: (ticker if counts.get(ticker, 0) == 1 else f"{ticker}_{int(permno)}")
+        for permno, ticker in base.items()
+    }
+
+
 # =============================================================================
-# WRDS hooks  --  OPTIONAL.  Need `pip install wrds` and a WRDS account.
-# These return tidy DataFrames; wire their output into the CSVs in main().
-# Each query is a sensible starting point -- align fiscal dates to your
-# formation windows for the real study.
+# WRDS source  --  Need `wrds` package and a WRDS account.
 # =============================================================================
 def wrds_sp500_constituents(start, end):
     """
@@ -123,12 +155,14 @@ def wrds_sp500_constituents(start, end):
     fix). Returns permno/ticker with the dates each name was in the index, so
     each formation window can be filtered to names alive on those dates.
     """
-    import wrds
-    db = wrds.Connection()                      # uses ~/.pgpass or prompts
+    db = _wrds_connection()                     # uses ~/.pgpass or prompts
     q = """
-        select a.permno, a.start, a.ending, b.ticker, b.comnam
+        select distinct a.permno, a.start, a.ending, b.ticker, b.comnam
         from   crsp_a_indexes.dsp500list a
-        join   crsp.stocknames b on a.permno = b.permno
+        join   crsp.stocknames b
+               on a.permno = b.permno
+              and b.namedt <= a.ending
+              and b.nameendt >= a.start
         where  a.ending >= %(s)s and a.start <= %(e)s
     """
     df = db.raw_sql(q, params={"s": start, "e": end})
@@ -137,31 +171,99 @@ def wrds_sp500_constituents(start, end):
     df["ticker"] = df["ticker"].map(normalize_ticker)
     df["start"] = pd.to_datetime(df["start"])
     df["end"] = pd.to_datetime(df["end"])
-    return df
+    df = df.dropna(subset=["ticker"])
+    canonical = _canonical_tickers_by_permno(df)
+    df["ticker"] = df["permno"].map(canonical)
+    return df.dropna(subset=["ticker"]).drop_duplicates(
+        ["permno", "ticker", "start", "end"])
 
 
-def wrds_sectors():
-    """GICS sector code per ticker from Compustat (comp.company)."""
-    import wrds
-    db = wrds.Connection()
-    df = db.raw_sql("select tic as ticker, gsector from comp.company where tic is not null")
+def wrds_company_metadata():
+    """GICS sector/sub-industry and IPO year from Compustat company metadata."""
+    db = _wrds_connection()
+    df = db.raw_sql("""
+        select tic as ticker, gsector, gind, gsubind, ipodate
+        from comp.company
+        where tic is not null
+    """)
     db.close()
-    df["gsector"] = df["gsector"].astype("Int64")
-    return df
+    df["ticker"] = df["ticker"].map(normalize_ticker)
+    df["sector"] = df["gsector"].map(
+        lambda x: str(int(x)) if pd.notna(x) else None)
+    industry = df["gsubind"].fillna(df["gind"]).fillna(df["gsector"])
+    df["industry"] = industry.map(
+        lambda x: str(int(x)) if pd.notna(x) else None)
+    df["ipo_year"] = pd.to_datetime(df["ipodate"], errors="coerce").dt.year
+    return df.drop_duplicates("ticker")
 
 
-def wrds_market_cap(asof="2018-12-31"):
-    """Market cap (|prc| * shrout) snapshot from CRSP daily file (crsp.dsf)."""
-    import wrds
-    db = wrds.Connection()
-    q = """
-        select b.ticker, abs(a.prc) * a.shrout / 1e6 as mcap_busd
-        from   crsp.dsf a join crsp.stocknames b on a.permno = b.permno
-        where  a.date = %(d)s
+def wrds_crsp_daily_prices(constituents: pd.DataFrame, start, end) -> pd.DataFrame:
     """
-    df = db.raw_sql(q, params={"d": asof}).dropna()
+    CRSP adjusted daily prices for all historical S&P 500 permnos.
+
+    CRSP stores signed raw prices; adjusted close is abs(prc) / cfacpr. The
+    column names use the historical ticker attached to the constituent record.
+    When a ticker maps to multiple permnos, duplicate date/ticker observations
+    are averaged after adjustment; this keeps the downstream backtest keyed by
+    ticker while retaining delisted historical names available in CRSP.
+    """
+    permnos = sorted({int(p) for p in constituents["permno"].dropna().unique()})
+    if not permnos:
+        return pd.DataFrame()
+    db = _wrds_connection()
+    frames = []
+    for chunk in _chunks(permnos, 800):
+        q = """
+            select permno, date, abs(prc) / nullif(cfacpr, 0) as adj_close
+            from crsp.dsf
+            where date between %(s)s and %(e)s
+              and permno in %(permnos)s
+              and prc is not null
+              and cfacpr is not null
+        """
+        frames.append(db.raw_sql(q, params={"s": start, "e": end, "permnos": tuple(chunk)}))
     db.close()
-    return df
+    raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+    raw["date"] = pd.to_datetime(raw["date"])
+    permno_ticker = (
+        constituents.sort_values(["permno", "end"])
+        .drop_duplicates("permno", keep="last")
+        .set_index("permno")["ticker"]
+    )
+    raw["ticker"] = raw["permno"].map(permno_ticker).map(normalize_ticker)
+    raw = raw.dropna(subset=["ticker", "adj_close"])
+    raw = raw.groupby(["date", "ticker"], as_index=False)["adj_close"].mean()
+    return raw.pivot(index="date", columns="ticker", values="adj_close").sort_index()
+
+
+def wrds_market_cap(constituents: pd.DataFrame, asof="2018-12-31"):
+    """Latest CRSP market cap snapshot in the 7 calendar days ending at `asof`."""
+    permnos = sorted({int(p) for p in constituents["permno"].dropna().unique()})
+    if not permnos:
+        return pd.DataFrame(columns=["ticker", "mcap_busd"])
+    start = (pd.Timestamp(asof) - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+    db = _wrds_connection()
+    q = """
+        select permno, date, abs(prc) * shrout / 1e6 as mcap_busd
+        from crsp.dsf
+        where date between %(s)s and %(e)s
+          and permno in %(permnos)s
+          and prc is not null and shrout is not null
+    """
+    df = db.raw_sql(q, params={"s": start, "e": asof, "permnos": tuple(permnos)}).dropna()
+    db.close()
+    if df.empty:
+        return pd.DataFrame(columns=["ticker", "mcap_busd"])
+    permno_ticker = (
+        constituents.sort_values(["permno", "end"])
+        .drop_duplicates("permno", keep="last")
+        .set_index("permno")["ticker"]
+    )
+    latest = df.sort_values("date").drop_duplicates("permno", keep="last")
+    latest["ticker"] = latest["permno"].map(permno_ticker).map(normalize_ticker)
+    return latest.dropna(subset=["ticker"])[["ticker", "mcap_busd"]]
 
 
 def wrds_fundamentals(fyear=2018):
@@ -169,8 +271,7 @@ def wrds_fundamentals(fyear=2018):
     Corporate-finance screen inputs from Compustat annual (comp.funda):
     profitability (ROA), gross margin, and operating cash flow.
     """
-    import wrds
-    db = wrds.Connection()
+    db = _wrds_connection()
     q = """
         select tic as ticker, ni, at, revt, cogs, oancf, fyear
         from   comp.funda
@@ -180,6 +281,7 @@ def wrds_fundamentals(fyear=2018):
     f = db.raw_sql(q, params={"fy": fyear})
     db.close()
     f = f.dropna(subset=["at", "revt"])
+    f["ticker"] = f["ticker"].map(normalize_ticker)
     f["profitability"] = f["ni"] / f["at"]
     f["gross_margin"] = (f["revt"] - f["cogs"]) / f["revt"]
     f["cfo"] = f["oancf"]
@@ -189,27 +291,30 @@ def wrds_fundamentals(fyear=2018):
 # =============================================================================
 # Main: cache everything to ./data
 # =============================================================================
-def main(use_wrds: bool = False):
+def main(source: str = "yfinance", universe: str = UNIVERSE):
     os.makedirs(DATA_DIR, exist_ok=True)
-    tickers = ETF_UNIVERSE if UNIVERSE == "etf" else SP500_FALLBACK
+    use_wrds = source == "wrds"
+    tickers = ETF_UNIVERSE if universe == "etf" else SP500_FALLBACK
 
     # ----- universe & sectors -----
-    if UNIVERSE == "sp500" and use_wrds:
-        # Replace the fallback list with point-in-time constituents.
+    if universe == "sp500" and use_wrds:
+        # Proposal-compliant path: point-in-time members + CRSP prices.
         all_start = min(start for start, _ in PERIODS.values())
         all_end = max(end for _, end in PERIODS.values())
         cons = wrds_sp500_constituents(all_start, all_end)
         tickers = sorted(cons["ticker"].dropna().unique().tolist())
         cons[["ticker", "start", "end", "permno", "comnam"]].to_csv(
             os.path.join(DATA_DIR, "membership.csv"), index=False)
-        sec = wrds_sectors().dropna()
-        sec["ticker"] = sec["ticker"].map(normalize_ticker)
-        pd.Series(sec.set_index("ticker")["gsector"].to_dict(), name="sector").to_csv(
-            os.path.join(DATA_DIR, "sectors.csv"))
-        wrds_market_cap().set_index("ticker")["mcap_busd"].rename("mcap").to_csv(
+        meta = wrds_company_metadata()
+        meta.set_index("ticker")["sector"].to_csv(os.path.join(DATA_DIR, "sectors.csv"))
+        meta.set_index("ticker")["industry"].to_csv(os.path.join(DATA_DIR, "industries.csv"))
+        meta.dropna(subset=["ipo_year"]).set_index("ticker")["ipo_year"].rename("ipo").to_csv(
+            os.path.join(DATA_DIR, "ipo.csv"))
+        wrds_market_cap(cons).set_index("ticker")["mcap_busd"].rename("mcap").to_csv(
             os.path.join(DATA_DIR, "mcap.csv"))
         wrds_fundamentals().to_csv(os.path.join(DATA_DIR, "fundamentals.csv"))
-    elif UNIVERSE == "sp500":
+        print(f"using {len(tickers)} historical S&P 500 symbols from WRDS/CRSP")
+    elif universe == "sp500":
         try:
             current = current_sp500_constituents()
             tickers = current["ticker"].tolist()
@@ -236,8 +341,11 @@ def main(use_wrds: bool = False):
 
     # ----- prices & VIX for each period -----
     for label, (start, end) in PERIODS.items():
-        print(f"downloading prices  [{label}] {start} -> {end} ...")
-        px = download_prices(tickers, start, end)
+        print(f"downloading prices  [{label}] {start} -> {end} via {source} ...")
+        if use_wrds and universe == "sp500":
+            px = wrds_crsp_daily_prices(cons, start, end)
+        else:
+            px = download_prices(tickers, start, end)
         px.to_csv(os.path.join(DATA_DIR, f"prices_{label}.csv"))
         print(f"  saved {px.shape[1]} names x {px.shape[0]} days")
 
@@ -249,5 +357,9 @@ def main(use_wrds: bool = False):
 
 
 if __name__ == "__main__":
-    # Set use_wrds=True after filling in your WRDS credentials for the real study.
-    main(use_wrds=False)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", choices=["yfinance", "wrds"], default="yfinance",
+                        help="Use yfinance fallback or WRDS/CRSP data.")
+    parser.add_argument("--universe", choices=["sp500", "etf"], default=UNIVERSE)
+    args = parser.parse_args()
+    main(source=args.source, universe=args.universe)

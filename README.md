@@ -5,8 +5,8 @@ QF621 Quantitative Trading Strategies - Group 9
 This repository implements the project proposal as a reproducible pairs-trading
 backtest:
 
-- Full S&P 500 universe fallback from Wikipedia/yfinance, with WRDS hooks for
-  point-in-time CRSP constituents and Compustat/CRSP firm characteristics.
+- WRDS/CRSP data path for point-in-time S&P 500 constituents and adjusted
+  daily prices, with Wikipedia/yfinance kept only as a no-WRDS fallback.
 - Engle-Granger two-step cointegration as the strict baseline.
 - 12-month formation window, 6-month trading window, rolling every 6 months.
 - Entry/exit/stop z-score rules, transaction costs, VIX gating, GARCH risk
@@ -92,7 +92,17 @@ Use cached data if it already exists:
 python run_backtest.py
 ```
 
-Download fresh yfinance/Wikipedia fallback data, then run:
+Download proposal-compliant WRDS/CRSP data, then run:
+
+```bash
+python download_data.py --source wrds
+python run_backtest.py
+```
+
+WRDS requires an active account. The `wrds` Python package will use your WRDS
+credentials or `~/.pgpass` setup.
+
+For a quick no-WRDS fallback run:
 
 ```bash
 python download_data.py
@@ -130,7 +140,7 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-python download_data.py
+python download_data.py --source wrds
 python run_backtest.py
 ```
 
@@ -154,14 +164,23 @@ scp -r ubuntu@YOUR_SERVER_IP:~/pairs_trading/output ./pairs_output
 
 ## Real Data Notes
 
-The default no-WRDS path uses current S&P 500 members from Wikipedia and
-yfinance adjusted closes. This is convenient for replication but still has
-survivorship bias. For a final institutional-quality study, enable the WRDS
-hooks in `download_data.py` to use:
+The final study should use the WRDS path:
 
 - CRSP `crsp_a_indexes.dsp500list` for point-in-time S&P 500 membership
+- CRSP `crsp.dsf` for adjusted daily stock prices, including historical and
+  delisted names available in CRSP
 - CRSP/Compustat for market cap and fundamentals
 - Compustat company metadata for GICS classifications
+
+Run it with:
+
+```bash
+python download_data.py --source wrds
+```
+
+The no-WRDS fallback uses current S&P 500 members from Wikipedia and yfinance
+adjusted closes. That path is convenient for replication but remains
+survivorship-biased and should not be treated as the final empirical result.
 
 The code already filters each formation window through `membership.csv` when a
 point-in-time membership file is available.
